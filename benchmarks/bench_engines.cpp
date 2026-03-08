@@ -1,10 +1,7 @@
 /**
  * @file bench_engines.cpp
  * @brief 撮合引擎 2x2x2 终极消融实验 (Ablation Study)
- * * 本测试框架旨在通过严格控制变量，量化分析三大底层优化维度对高频撮合系统的性能影响：
- * 1. 寻址算法 (Algorithm): std::map (O(logN)) vs 定长数组 (O(1))
- * 2. 节点结构 (Container): std::list (隐式内存分配) vs 侵入式链表 (零内存分配)
- * 3. 内存管理 (Allocator): System new (系统调用) vs Memory Pool (预分配连续内存)
+ * * 引入稳态交织 (Steady-State Interleaved) 压测模型与尾部延迟 (Tail Latency) 统计
  */
 
 #include <benchmark/benchmark.h>
@@ -17,83 +14,151 @@
 #include <random>
 #include <memory>
 #include <type_traits>
+#include <chrono>
+#include <algorithm>
 
 using namespace matching_engine;
 
 // ==========================================
-// 1. 实盘数据模拟器
+// 1. 实盘数据模拟器 (稳态交织模型)
 // ==========================================
-struct OrderData {
-    uint32_t id; Side side; uint32_t price; uint32_t quantity; uint64_t timestamp;
+struct BenchEvent {
+    bool is_cancel;
+    uint32_t id; 
+    Side side; 
+    uint32_t price; 
+    uint32_t quantity; 
+    uint64_t timestamp;
+};
+
+struct BenchmarkStream {
+    std::vector<BenchEvent> warmup_orders;   // 预热订单，建立盘口深度
+    std::vector<BenchEvent> hot_loop_events; // 跑分核心事件流 (Add/Cancel交织)
 };
 
 /**
- * @brief 生成极度逼真的 A 股订单流
- * 采用固定随机种子保证公平性。价格严格限制在 90.00 到 110.00 之间，
- * 符合 A 股 10% 涨跌幅限制的真实物理规律。
+ * @brief 生成符合 HFT 稳态深度的交织事件流
+ * @param steady_depth 盘口保持的存量订单数量
+ * @param num_events 测试循环中的事件总数
  */
-static std::vector<OrderData> generate_realistic_orders(size_t num_orders) {
-    std::vector<OrderData> orders;
-    orders.reserve(num_orders);
+static BenchmarkStream generate_steady_state_stream(size_t steady_depth, size_t num_events) {
+    BenchmarkStream stream;
+    stream.warmup_orders.reserve(steady_depth);
+    stream.hot_loop_events.reserve(num_events);
+    
     std::mt19937 gen(42); 
     std::uniform_int_distribution<uint32_t> side_dist(0, 1);
-    
-    // 价格范围：900 到 1100，乘以 Tick Size 100，得到 90000 到 110000 的合法报价
     std::uniform_int_distribution<uint32_t> price_dist(900, 1100); 
     std::uniform_int_distribution<uint32_t> lot_dist(1, 100);
+    std::uniform_int_distribution<uint32_t> action_dist(0, 1); // 0 = Add, 1 = Cancel
 
-    for (size_t i = 0; i < num_orders; ++i) {
-        orders.push_back({
-            static_cast<uint32_t>(i + 1), static_cast<Side>(side_dist(gen)),
-            price_dist(gen) * 100, lot_dist(gen) * 100, static_cast<uint64_t>(1000000 + i) 
+    uint32_t current_id = 1;
+    std::vector<uint32_t> active_ids; // 记录盘口中的活跃订单，用于随机撤销
+    active_ids.reserve(steady_depth + num_events);
+
+    // 1. 建立初始深度 (预热阶段)
+    for (size_t i = 0; i < steady_depth; ++i) {
+        stream.warmup_orders.push_back({
+            false, current_id, static_cast<Side>(side_dist(gen)),
+            price_dist(gen) * 100, lot_dist(gen) * 100, static_cast<uint64_t>(1000000 + i)
         });
+        active_ids.push_back(current_id);
+        current_id++;
     }
-    return orders;
+
+    // 2. 生成交织操作 (跑分阶段)
+    for (size_t i = 0; i < num_events; ++i) {
+        // 为了维持盘口深度，如果 active_ids 不为空且随机数为 1，则生成 Cancel
+        if (!active_ids.empty() && action_dist(gen) == 1) {
+            // 随机选一个活跃订单撤销 (模拟真实撤单行为)
+            std::uniform_int_distribution<size_t> idx_dist(0, active_ids.size() - 1);
+            size_t target_idx = idx_dist(gen);
+            uint32_t cancel_id = active_ids[target_idx];
+            
+            // 快速移除选中的 ID
+            std::swap(active_ids[target_idx], active_ids.back());
+            active_ids.pop_back();
+
+            stream.hot_loop_events.push_back({
+                true, cancel_id, Side::BUY, 0, 0, 0 
+            });
+        } else {
+            // 生成 Add 订单
+            stream.hot_loop_events.push_back({
+                false, current_id, static_cast<Side>(side_dist(gen)),
+                price_dist(gen) * 100, lot_dist(gen) * 100, static_cast<uint64_t>(1000000 + steady_depth + i)
+            });
+            active_ids.push_back(current_id);
+            current_id++;
+        }
+    }
+    return stream;
 }
 
 // ==========================================
-// 2. 通用消融实验模板 (核心跑分逻辑)
+// 2. 通用消融实验模板 (包含 Tail Latency 统计)
 // ==========================================
 template <typename EngineType>
 static void BM_Ablation_Study(benchmark::State& state) {
-    const size_t num_orders = state.range(0);
-    auto orders = generate_realistic_orders(num_orders);
+    const size_t steady_depth = 10000;       // 维持 1 万个存量盘口
+    const size_t num_events = state.range(0); // 跑分事件数
+    auto stream = generate_steady_state_stream(steady_depth, num_events);
     
-    // 【避坑指南】：引擎的初始化必须在计时循环外部进行！
-    // 否则测出的就是 OS 分配大内存的时间，而不是真实撮合性能。
     std::unique_ptr<EngineType> engine;
-    
-    // 模板元编程：自动探测引擎是否需要价格区间参数 (Array需要，Map不需要)
     if constexpr (std::is_constructible_v<EngineType, uint32_t, uint32_t, uint32_t>) {
         engine = std::make_unique<EngineType>(90000, 110000, 100);
     } else {
         engine = std::make_unique<EngineType>();
     }
 
-    // 【缓存预热 (Cache Warming)】：
-    // 先跑一轮完整的报单撤单，把引擎的连续内存块全部“拉”进 CPU 的 L1/L2 缓存。
-    for (const auto& o : orders) engine->add_order(o.id, o.side, o.price, o.quantity, o.timestamp);
-    for (const auto& o : orders) engine->cancel_order(o.id);
+    // 用于统计尾部延迟 (预先分配避免干扰测试)
+    std::vector<uint64_t> latencies;
+    latencies.resize(num_events);
 
-    // 真正的计时循环开始
+    // 真正的计时循环
     for (auto _ : state) {
-        // 批量报单
-        for (const auto& o : orders) {
-            engine->add_order(o.id, o.side, o.price, o.quantity, o.timestamp);
+        // 【缓存预热】
+        state.PauseTiming();
+        // 清理上一次循环遗留的状态（针对连续跑分）
+        for (const auto& ev : stream.warmup_orders) engine->cancel_order(ev.id);
+        for (const auto& ev : stream.hot_loop_events) engine->cancel_order(ev.id);
+        
+        // 灌入初始盘口深度
+        for (const auto& ev : stream.warmup_orders) {
+            engine->add_order(ev.id, ev.side, ev.price, ev.quantity, ev.timestamp);
         }
-        // 批量撤单 (模拟高频交易中极高的 Cancel/Order 比例，同时复位内存池状态)
-        for (const auto& o : orders) {
-            engine->cancel_order(o.id);
+        state.ResumeTiming();
+
+        // 【极速核心循环】
+        size_t l_idx = 0;
+        for (const auto& ev : stream.hot_loop_events) {
+            auto start = std::chrono::high_resolution_clock::now();
+            
+            if (ev.is_cancel) {
+                engine->cancel_order(ev.id);
+            } else {
+                engine->add_order(ev.id, ev.side, ev.price, ev.quantity, ev.timestamp);
+            }
+            
+            auto end = std::chrono::high_resolution_clock::now();
+            latencies[l_idx++] = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
         }
     }
     
-    // 吞吐量统计：每次循环执行了 N 次报单 + N 次撤单 = 2N 次操作
-    state.SetItemsProcessed(state.iterations() * num_orders * 2);
+    // 吞吐量统计
+    state.SetItemsProcessed(state.iterations() * num_events);
+
+    // 计算延迟分布 (仅针对最后一次 Iteration，代表系统的最终稳态)
+    std::sort(latencies.begin(), latencies.end());
+    state.counters["p50_ns"] = benchmark::Counter(latencies[num_events * 0.50]);
+    state.counters["p90_ns"] = benchmark::Counter(latencies[num_events * 0.90]);
+    state.counters["p99_ns"] = benchmark::Counter(latencies[num_events * 0.99]);
+    state.counters["p99.9_ns"] = benchmark::Counter(latencies[num_events * 0.999]);
 }
 
 // =========================================================================
 // 3. 注册 2 x 2 x 2 终极消融实验矩阵
-// 命名规范: BM_{Map|Arr}_{StdLst|Intru}_{SysAlloc|PoolAlloc}
+// 统一设定：100,000 条跑分交织事件
 // =========================================================================
 
 // --- 赛区 1：Map 组 (红黑树 O(logN) 寻址) ---

@@ -52,7 +52,6 @@ public:
 
     void deallocate(T* ptr) {
         if (!ptr) return;
-        ptr->~T();
         free_list_.push_back(ptr);
     }
 };
