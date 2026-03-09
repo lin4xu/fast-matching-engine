@@ -1,11 +1,6 @@
 /**
  * @file bench_engines.cpp
- * @brief 撮合引擎 3x3 终极消融实验 (Ablation Study)
- * * 两个正交维度：
- * 1. 寻址算法 (3种): Map (红黑树 O(logN)) vs Array (定长数组 O(K)) vs Bitset (硬件位图 O(1))
- * 2. 内存与节点 (3种): SysAlloc+StdLst vs PoolAlloc+StdLst vs PoolAlloc+Intru(侵入式零分配)
- *
- * 测试模型：稳态交织 (Steady-State Interleaved) 压测模型与尾部延迟 (Tail Latency) 统计
+ * @brief 撮合引擎 3x3 终极消融实验 (Ablation Study) - 修正了硬件 TSC 计时器
  */
 
 #include <benchmark/benchmark.h>
@@ -23,47 +18,66 @@
 #include <chrono>
 #include <algorithm>
 
+// ==========================================
+// 硬件 TSC 计时器 (解决高精度测量墙问题)
+// ==========================================
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+
+// 获取带有管线序列化屏障的 CPU 时钟周期
+inline uint64_t get_cpu_cycles() {
+    unsigned int aux;
+    return __rdtscp(&aux);
+}
+
+// 动态估算当前 CPU 的每周期纳秒数 (ns per cycle)
+static double get_nanoseconds_per_cycle() {
+    auto start_time = std::chrono::high_resolution_clock::now();
+    uint64_t start_cycles = get_cpu_cycles();
+    
+    // Busy wait 约 10 毫秒用于采样校准
+    volatile uint64_t sum = 0;
+    for(int i = 0; i < 5000000; ++i) sum += i; 
+    
+    uint64_t end_cycles = get_cpu_cycles();
+    auto end_time = std::chrono::high_resolution_clock::now();
+    
+    auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    return static_cast<double>(elapsed_ns) / (end_cycles - start_cycles);
+}
+
 using namespace matching_engine;
 
 // ==========================================
-// 1. 实盘数据模拟器 (稳态交织模型)
+// 1. 实盘数据模拟器 (保持原样)
 // ==========================================
 struct BenchEvent {
-    bool is_cancel;
-    uint32_t id; 
-    Side side; 
-    uint32_t price; 
-    uint32_t quantity; 
-    uint64_t timestamp;
+    bool is_cancel; uint32_t id; Side side; uint32_t price; uint32_t quantity; uint64_t timestamp;
 };
 
 struct BenchmarkStream {
-    std::vector<BenchEvent> warmup_orders;   // 预热订单，建立初始的庞大盘口深度
-    std::vector<BenchEvent> hot_loop_events; // 跑分核心事件流 (Add/Cancel 随机交织)
+    std::vector<BenchEvent> warmup_orders;
+    std::vector<BenchEvent> hot_loop_events;
 };
 
-/**
- * @brief 生成符合 HFT 稳态深度的交织事件流
- * @param steady_depth 盘口保持的存量订单数量
- * @param num_events 测试循环中的事件总数
- */
 static BenchmarkStream generate_steady_state_stream(size_t steady_depth, size_t num_events) {
     BenchmarkStream stream;
     stream.warmup_orders.reserve(steady_depth);
     stream.hot_loop_events.reserve(num_events);
     
-    // 固定随机种子，保证所有受测引擎面临的“盘口物理状态”绝对一致
     std::mt19937 gen(42); 
     std::uniform_int_distribution<uint32_t> side_dist(0, 1);
     std::uniform_int_distribution<uint32_t> price_dist(900, 1100); 
     std::uniform_int_distribution<uint32_t> lot_dist(1, 100);
-    std::uniform_int_distribution<uint32_t> action_dist(0, 1); // 0 = Add (报单), 1 = Cancel (撤单)
+    std::uniform_int_distribution<uint32_t> action_dist(0, 1);
 
     uint32_t current_id = 1;
-    std::vector<uint32_t> active_ids; // 记录盘口中的活跃订单ID，用于真实模拟随机撤单
+    std::vector<uint32_t> active_ids; 
     active_ids.reserve(steady_depth + num_events);
 
-    // 1. 建立初始深度 (预热阶段，不计入跑分时间)
     for (size_t i = 0; i < steady_depth; ++i) {
         stream.warmup_orders.push_back({
             false, current_id, static_cast<Side>(side_dist(gen)),
@@ -73,24 +87,17 @@ static BenchmarkStream generate_steady_state_stream(size_t steady_depth, size_t 
         current_id++;
     }
 
-    // 2. 生成交织操作 (真实的跑分测试阶段)
     for (size_t i = 0; i < num_events; ++i) {
-        // 为了维持盘口深度，如果 active_ids 不为空且随机数为 1，则生成撤单事件
         if (!active_ids.empty() && action_dist(gen) == 1) {
-            // 从活跃订单中随机挑选一个进行撤销
             std::uniform_int_distribution<size_t> idx_dist(0, active_ids.size() - 1);
             size_t target_idx = idx_dist(gen);
             uint32_t cancel_id = active_ids[target_idx];
             
-            // O(1) 移除被选中的 ID
             std::swap(active_ids[target_idx], active_ids.back());
             active_ids.pop_back();
 
-            stream.hot_loop_events.push_back({
-                true, cancel_id, Side::BUY, 0, 0, 0 
-            });
+            stream.hot_loop_events.push_back({ true, cancel_id, Side::BUY, 0, 0, 0 });
         } else {
-            // 生成新的报单事件
             stream.hot_loop_events.push_back({
                 false, current_id, static_cast<Side>(side_dist(gen)),
                 price_dist(gen) * 100, lot_dist(gen) * 100, static_cast<uint64_t>(1000000 + steady_depth + i)
@@ -103,48 +110,43 @@ static BenchmarkStream generate_steady_state_stream(size_t steady_depth, size_t 
 }
 
 // ==========================================
-// 2. 通用消融实验模板 (包含 Tail Latency 统计)
+// 2. 通用消融实验模板 (修正延迟测量机制)
 // ==========================================
 template <typename EngineType>
 static void BM_Ablation_Study(benchmark::State& state) {
-    const size_t steady_depth = 10000;        // 维持 1 万个存量盘口深度，放大缓存失效率
-    const size_t num_events = state.range(0); // 每次跑分的事件数量 (Add/Cancel交替)
+    // 预先计算转换率，避免在跑分中引入性能波动
+    static double ns_per_cycle = get_nanoseconds_per_cycle();
+
+    const size_t steady_depth = 10000;
+    const size_t num_events = state.range(0);
     auto stream = generate_steady_state_stream(steady_depth, num_events);
     
     std::unique_ptr<EngineType> engine;
     
-    // 使用 SFINAE 或 constexpr 判定引擎的构造方式
-    // Array 和 Bitset 版本需要 min_price, max_price, tick_size
     if constexpr (std::is_constructible_v<EngineType, uint32_t, uint32_t, uint32_t>) {
         engine = std::make_unique<EngineType>(90000, 110000, 100);
     } else {
-        // Naive (Map) 版本只需默认构造
         engine = std::make_unique<EngineType>();
     }
 
-    // 用于统计尾部延迟 (预先分配，避免干扰测试过程)
-    std::vector<uint64_t> latencies;
-    latencies.resize(num_events);
+    // 记录的是 Cycles 而不是 ns，消除浮点转换开销
+    std::vector<uint64_t> latencies_cycles;
+    latencies_cycles.resize(num_events);
 
-    // 核心跑分循环 (Benchmark 会自动决定执行多少次迭代)
     for (auto _ : state) {
-        // 【准备阶段：暂停计时】
         state.PauseTiming();
-        // 清理上一次迭代遗留的脏数据状态
         for (const auto& ev : stream.warmup_orders) engine->cancel_order(ev.id);
         for (const auto& ev : stream.hot_loop_events) engine->cancel_order(ev.id);
         
-        // 灌入初始盘口深度 (重建稳态环境)
         for (const auto& ev : stream.warmup_orders) {
             engine->add_order(ev.id, ev.side, ev.price, ev.quantity, ev.timestamp);
         }
         state.ResumeTiming();
-        // 【恢复计时：进入极速核心区域】
 
         size_t l_idx = 0;
         for (const auto& ev : stream.hot_loop_events) {
-            // 使用高精度时钟记录每次操作的耗时
-            auto start = std::chrono::high_resolution_clock::now();
+            // 【核心修正】：使用硬件周期获取最纯净的操作开销
+            uint64_t start_cycle = get_cpu_cycles();
             
             if (ev.is_cancel) {
                 engine->cancel_order(ev.id);
@@ -152,42 +154,35 @@ static void BM_Ablation_Study(benchmark::State& state) {
                 engine->add_order(ev.id, ev.side, ev.price, ev.quantity, ev.timestamp);
             }
             
-            auto end = std::chrono::high_resolution_clock::now();
-            latencies[l_idx++] = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+            uint64_t end_cycle = get_cpu_cycles();
+            latencies_cycles[l_idx++] = (end_cycle - start_cycle);
         }
     }
     
-    // 报告总体吞吐量 (Ops/sec)
     state.SetItemsProcessed(state.iterations() * num_events);
 
-    // 计算延迟分布分布 (选取最后一次迭代的数组作为稳态的样本)
-    std::sort(latencies.begin(), latencies.end());
-    state.counters["p50_ns"]   = benchmark::Counter(latencies[static_cast<size_t>(num_events * 0.50)]);
-    state.counters["p90_ns"]   = benchmark::Counter(latencies[static_cast<size_t>(num_events * 0.90)]);
-    state.counters["p99_ns"]   = benchmark::Counter(latencies[static_cast<size_t>(num_events * 0.99)]);
-    state.counters["p99.9_ns"] = benchmark::Counter(latencies[static_cast<size_t>(num_events * 0.999)]);
+    // 计算延迟分布 (将 Cycle 转换为 ns)
+    std::sort(latencies_cycles.begin(), latencies_cycles.end());
+    state.counters["p50_ns"]   = benchmark::Counter(latencies_cycles[static_cast<size_t>(num_events * 0.50)] * ns_per_cycle);
+    state.counters["p90_ns"]   = benchmark::Counter(latencies_cycles[static_cast<size_t>(num_events * 0.90)] * ns_per_cycle);
+    state.counters["p99_ns"]   = benchmark::Counter(latencies_cycles[static_cast<size_t>(num_events * 0.99)] * ns_per_cycle);
+    state.counters["p99.9_ns"] = benchmark::Counter(latencies_cycles[static_cast<size_t>(num_events * 0.999)] * ns_per_cycle);
 }
 
 // =========================================================================
-// 3. 注册 3 x 3 终极消融实验矩阵
-// 统一设定：100,000 条跑分交织事件
+// 3. 注册矩阵
 // =========================================================================
-
-// --- 赛区 1：Map 组 (红黑树 O(logN) 寻址，被算法拖累的组别) ---
 BENCHMARK_TEMPLATE(BM_Ablation_Study, EngineNaive<SystemAllocator<Order>>)->Name("BM_Map_SysAlloc_StdLst")->Arg(100000);
 BENCHMARK_TEMPLATE(BM_Ablation_Study, EngineNaive<PoolAllocator<Order>>)->Name("BM_Map_PoolAlloc_StdLst")->Arg(100000);
 BENCHMARK_TEMPLATE(BM_Ablation_Study, EngineNaiveIntrusive<PoolAllocator<Order>>)->Name("BM_Map_PoolAlloc_Intru")->Arg(100000);
 
-// --- 赛区 2：Array 组 (连续数组 + While 循环 O(K) 线性搜索，存在极大尾部延迟毛刺) ---
 BENCHMARK_TEMPLATE(BM_Ablation_Study, EngineArray<SystemAllocator<Order>>)->Name("BM_Arr_SysAlloc_StdLst")->Arg(100000);
 BENCHMARK_TEMPLATE(BM_Ablation_Study, EngineArray<PoolAllocator<Order>>)->Name("BM_Arr_PoolAlloc_StdLst")->Arg(100000);
 BENCHMARK_TEMPLATE(BM_Ablation_Study, EngineArrayIntrusive<PoolAllocator<Order>>)->Name("BM_Arr_PoolAlloc_Intru")->Arg(100000);
 
-// --- 赛区 3：Bitset 组 (位图降维，硬件指令级 O(1) 搜索，量化界天花板) ---
 BENCHMARK_TEMPLATE(BM_Ablation_Study, EngineBitset<SystemAllocator<Order>>)->Name("BM_Bit_SysAlloc_StdLst")->Arg(100000);
 BENCHMARK_TEMPLATE(BM_Ablation_Study, EngineBitset<PoolAllocator<Order>>)->Name("BM_Bit_PoolAlloc_StdLst")->Arg(100000);
 
-// 👑 终极大满贯形态：O(1)硬件寻址 + O(1)链表操作 + 0内存分配开销 + Union紧凑内存布局
 BENCHMARK_TEMPLATE(BM_Ablation_Study, EngineBitsetIntrusive<PoolAllocator<Order>>)->Name("BM_Bit_PoolAlloc_Intru")->Arg(100000);
 
 BENCHMARK_MAIN();

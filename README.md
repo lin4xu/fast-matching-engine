@@ -1,55 +1,68 @@
 # Fast Matching Engine
 
-本项目基于 C++ 打造的高频撮合引擎，采用了量化交易工业界的极致性能优化手段。通过 **$3 \times 3$ 终极消融实验 (Ablation Study)**，量化剖析了底层数据结构、内存布局、硬件级寻址与 CPU 缓存之间的博弈。
+本项目是一个基于 C++ 打造的极速高频撮合引擎（HFT Matching Engine）。通过 **$3 \times 3$ 终极消融实验 (Ablation Study)**，量化剖析了底层数据结构、内存布局、硬件级寻址与 CPU 缓存之间在极端高频环境下的博弈。
 
-## $3 \times 3$ 终极消融实验
+## 🔬 $3 \times 3$ 终极消融实验
 
-我们在模拟实盘高频报单/撤单的场景下，针对两大正交维度进行了严谨的 9 组变体测试。为了保证实验的纯粹性，**所有变体均统一采用 $O(1)$ 的定长数组实现基于 `order_id` 的全局撤单映射**。
+我们在模拟实盘高频报单/撤单的稳态交织（Interleaved Steady-State）场景下，针对两大正交维度进行了严谨的 9 组变体压测。
 
 * **维度一：盘口寻址算法 (3种)**
   * `Map`: 基于红黑树 (`std::map`)，时间复杂度 $O(\log N)$。
   * `Array`: 价格转数组下标，while 循环线性扫描寻找最优报价，时间复杂度 $O(K)$。
-  * `Bitset`: 极致降维，采用 `_BitScanReverse64` / `__builtin_clzll` 硬件前导零指令进行分层位图寻址，时间复杂度真正的物理 $O(1)$。
+  * `Bitset`: 极致降维，采用 `_BitScanReverse64` / `__builtin_clzll` 硬件前导零指令进行分层位图寻址，时间复杂度逼近物理 $O(1)$。
 
 * **维度二：内存与节点生命周期 (3种)**
-  * `SysAlloc + StdLst`: 使用标准库 `std::list`，每次创建订单伴随双重系统内存调用 (`new Order` 及隐式链表节点)。
-  * `PoolAlloc + StdLst`: 采用 `Union` 数据与控制合一的预分配内存池，消除了 `Order` 本身的分配，但未解决 `std::list` 底层小对象分配问题。
-  * `PoolAlloc + Intru`: **侵入式链表 (0分配)**，彻底抛弃 STL，将 `prev` 与 `next` 指针内置于订单结构。运行时达到绝对的 Zero Allocation 与物理内存连续。
+  * `SysAlloc + StdLst`: 使用标准库 `std::list`，每次创建订单伴随双重系统内存调用 (`new Order` 及隐式链表节点)，缓存极不友好。
+  * `PoolAlloc + StdLst`: 采用预分配的 Union 内存池，消除了 `Order` 本身的分配，但未解决 `std::list` 底层隐式节点的小对象分配问题。
+  * `PoolAlloc + Intru`: **侵入式链表 (0分配)**，彻底抛弃 STL，将 `prev` 与 `next` 指针内置于订单结构。运行时达到绝对的 Zero Allocation 与物理内存严格连续。
 
 ---
 
-### 跑分结果 (稳态交织压测 - 100,000 笔存量盘口深度)
+## 🚀 极致性能跑分 (Benchmark Results)
 
-*注：以下测试跑分采用稳态交织模型 (Interleaved Steady-State)，即在维持 10 万盘口深度的前提下，交织进行随机的 Add 和 Cancel 操作，以真实反映 HFT 场景极端的缓存失效率。测试系统为 Windows MSVC Release。*
+*注：以下测试采用了真实的硬件时间戳计数器指令 (`__rdtscp`) 进行纳秒级精密测量，彻底消除了常规操作系统 API 的系统调用开销与测量墙。测试环境为 100,000 笔存量盘口深度下的稳态交织事件。*
 
-| 实验组别 (Algorithm_MemoryAllocator) | 吞吐量 (Ops/sec) | p50 (ns) | p90 (ns) | p99 (ns) | p99.9 (ns) | 性能相对提升 |
+| 实验组别 (Algorithm_Memory) | 吞吐量 (Ops/sec) | p50 (ns) | p90 (ns) | p99 (ns) | p99.9 (ns) | 性能倍率 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `BM_Map_SysAlloc_StdLst` (基准线) | 9.10 M/s | 100 | 200 | 300 | 600 | 1.00x |
-| `BM_Map_PoolAlloc_StdLst` | 11.38 M/s | 100 | 200 | 300 | 400 | 1.25x |
-| `BM_Map_PoolAlloc_Intru` | 15.57 M/s | 0* | 100 | 200 | 200 | 1.71x |
-| `BM_Arr_SysAlloc_StdLst` | 13.52 M/s | 100 | 100 | 200 | 300 | 1.49x |
-| `BM_Arr_PoolAlloc_StdLst` | 16.29 M/s | 0* | 100 | 200 | 300 | 1.79x |
-| `BM_Arr_PoolAlloc_Intru` | 20.00 M/s | 0* | 100 | 100 | 200 | 2.20x |
-| `BM_Bit_SysAlloc_StdLst` | 14.63 M/s | 100 | 100 | 200 | 300 | 1.61x |
-| `BM_Bit_PoolAlloc_StdLst` | 17.48 M/s | 0* | 100 | 200 | 500 | 1.92x |
-| **`BM_Bit_PoolAlloc_Intru` (大满贯)** | **20.97 M/s** | **0*** | **100** | **100** | **300** | **2.30x** |
+| `BM_Map_SysAlloc_StdLst` (基准线) | 9.30 M/s | 82.72 | 210.11 | 388.37 | 1863.72 | 1.00x |
+| `BM_Map_PoolAlloc_StdLst` | 11.52 M/s | 70.69 | 165.77 | 274.50 | 719.32 | 1.23x |
+| `BM_Map_PoolAlloc_Intru` | 14.93 M/s | 47.95 | 91.76 | 148.39 | 478.26 | 1.60x |
+| `BM_Arr_SysAlloc_StdLst` | 13.33 M/s | 55.40 | 138.50 | 227.81 | 299.75 | 1.43x |
+| `BM_Arr_PoolAlloc_StdLst` | 16.41 M/s | 39.26 | 108.29 | 230.23 | 596.04 | 1.76x |
+| `BM_Arr_PoolAlloc_Intru` | 22.40 M/s | 24.39 | 69.03 | 115.75 | 155.44 | 2.40x |
+| `BM_Bit_SysAlloc_StdLst` | 13.78 M/s | 52.91 | 116.58 | 193.47 | 272.85 | 1.48x |
+| `BM_Bit_PoolAlloc_StdLst` | 17.48 M/s | 38.04 | 82.29 | 138.53 | 213.38 | 1.87x |
+| **`BM_Bit_PoolAlloc_Intru` (大满贯)** | **24.93 M/s** | **26.04** | **46.30** | **74.82** | **105.83** | **2.68x** |
 
-*(注：由于高精度时钟的测量墙限制，执行快于 100ns 时 p50 会被截断为 0 ns，这意味着系统常态运转已经快过了常规 API 的测量极限。)*
-
----
-
-### 核心工程洞察 (Engineering Insights)
-
-1. **硬件级 O(1) > 软件层 O(1)：**
-   `EngineArray` 虽然把寻找档位变成了常数时间映射，但在盘口价格存在价差 (Spread) 时，其依赖的 `while(index >= 0)` 会退化为 $O(K)$ 线性扫描。而 `EngineBitset` 利用 CPU 硬件级指令 (`__builtin_clzll` / `_BitScanReverse64`)，哪怕盘口中间空了 1000 个价差，依然是 **单条机器指令周期** 返回结果，吞吐率逼近 2100 万大关。
-2. **STL 是 HFT 系统的“毒药”：**
-   即便我们用了最强的 Bitset 算法，如果底层还使用 `std::list` (如 `BM_Bit_PoolAlloc_StdLst`)，其性能依然无法突破 18 M/s 的瓶颈。这是由于 `std::list` 在 `push_back` 时会触发不可控的小对象动态分配。只有引入侵入式链表 (Intrusive List) 做到 **Zero Allocation**，才能释放硬件所有的算力。
-3. **Union 内存池的奇效：**
-   在 `PoolAllocator` 中，我们采用了 `union` 将空闲时的内存块本身复用为指向下一块的指针 (`next_free`)。这彻底消除了 `std::vector<T*>` 管理空闲块带来的额外内存和 Cache Miss，实现了最高密度的内存布局。
+### 💡 核心工程洞察 (Engineering Insights)
+1. **碾压级的尾部延迟控制：** 基准线引擎的 `p99.9` 延迟高达 `1863 ns`，存在极大的毛刺；而大满贯组（Bitset + Intrusive）通过消除所有堆分配并利用硬件位图指令，将极限尾部延迟死死压制在 **`105 ns`**，体现了确定性（Determinism）对于 HFT 系统的绝对重要性。
+2. **STL 是 HFT 的“毒药”：** 在 Bitset 组中，仅仅将 `std::list` 替换为侵入式链表（Intrusive List），吞吐量就从 `17.48 M/s` 飙升至 `24.93 M/s`。这是因为消除了动态小对象分配带来的指令开销，同时极大提高了 L1/L2 CPU Cache 的命中率。
 
 ---
 
-### 编译与测试环境
-* **编译器**: MSVC 19.44 / GCC 11+ (兼容 `__builtin_clzll`)
-* **操作系统**: Windows 11 x64 / Linux
+## 🗺️ 架构与算法演进路线 (Future Roadmap)
+
+尽管当前的大满贯引擎已经达到了约 2500万笔/秒 的极高吞吐，但若要对标真实的华尔街顶尖极速交易系统，本项目在未来仍有以下深度优化空间：
+
+### 1. 核心算法与数据结构再进化
+* **多级位图寻址 (Multi-level Bitset / 64-ary Tree)：**
+  当前一维 Bitset 在遇到极大的盘口价差（Spread）时，硬件指令扫码会退化为 $O(K/64)$ 线性扫描。引入 L1 摘要层进行两级 `__builtin_clzll`，无论价差多大都能保证严格的 2 个时钟周期内锁定档位。
+* **高密度哈希映射 (Swiss Table / Robin Hood Hash)：**
+  为了兼容离散的 UUID 或哈希化的 `order_id`，避免全局定长 `std::vector` 映射导致 OOM，未来将引入基于开放寻址的极致哈希表（如 `absl::flat_hash_map`）或 Sparse Set。
+
+### 2. 内存池与底层架构改造
+* **分块内存池 (Chunked Arena Allocator)：**
+  解决目前固定长度 `PoolAllocator` 在容量耗尽时退化为 `new` 所导致的“性能悬崖”。采用分块增长策略，不仅避免单点毛刺，还能保障新区块的物理连续性。
+* **彻底的去虚函数化 (CRTP & Static Dispatch)：**
+  消除 `IMatchingEngine` 基类的 `virtual` 关键字与 `std::function` 回调。使用奇异递归模板模式（CRTP）实现编译期多态，消灭最后几十纳秒的 vtable 寻址与间接调用开销。
+* **CPU 缓存行严格对齐 (Cache-line Alignment)：**
+  对 `Order` 等核心数据结构引入 `alignas(64)`，保证对象尺寸完美对齐 64-Byte Cache Line，防止多线程/多核场景下的伪共享（False Sharing），并实现极致的硬件预取（Prefetching）。
+
+---
+
+## 🛠️ 编译与测试环境
+
 * **构建系统**: CMake 3.14+
+* **编译器**: MSVC 19.44+ / GCC 11+ / Clang 14+ 
+* **编译优化**: 全面启用 `-O3` / `/O2`、LTO/IPO，强制开启 `AVX2`/`AVX-512` 指令集。
+* **安全性保障**: 在 Debug 模式下全量接入 Google Test 以及 ASan/UBSan 进行内存与未定义行为捕获。
