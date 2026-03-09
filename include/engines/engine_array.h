@@ -3,7 +3,6 @@
 #include "../common/order.h"
 #include <vector>
 #include <list>
-#include <unordered_map>
 #include <algorithm>
 #include <utility>
 
@@ -12,17 +11,19 @@ namespace matching_engine {
 template <typename Allocator>
 class EngineArray : public IMatchingEngine {
 public:
-    EngineArray(uint32_t min_price, uint32_t max_price, uint32_t tick_size)
+    EngineArray(uint32_t min_price, uint32_t max_price, uint32_t tick_size, size_t max_orders = 1000000)
         : min_price_(min_price), max_price_(max_price), tick_size_(tick_size),
           best_bid_index_(-1), best_ask_index_(-1) {
+        
         uint32_t num_levels = (max_price_ - min_price_) / tick_size_ + 1;
         bids_.resize(num_levels);
         asks_.resize(num_levels);
+        order_map_.resize(max_orders + 1, {nullptr, {}});
     }
 
     ~EngineArray() override {
         for (auto &kv : order_map_) {
-            Order* o = kv.second.first;
+            Order* o = kv.first;
             if (o) allocator_.deallocate(o);
         }
     }
@@ -32,28 +33,26 @@ public:
         if (index == -1) return;
 
         Order* new_order = allocator_.allocate(order_id, side, price, quantity, timestamp);
-        order_map_[order_id] = std::make_pair(new_order, std::list<Order*>::iterator());
 
         if (side == Side::BUY) {
             bids_[index].push_back(new_order);
-            auto it = std::prev(bids_[index].end());
-            order_map_[order_id].second = it;
+            if (order_id < order_map_.size()) order_map_[order_id] = {new_order, std::prev(bids_[index].end())};
+            
             if (best_bid_index_ == -1 || index > best_bid_index_) best_bid_index_ = index;
         } else {
             asks_[index].push_back(new_order);
-            auto it = std::prev(asks_[index].end());
-            order_map_[order_id].second = it;
+            if (order_id < order_map_.size()) order_map_[order_id] = {new_order, std::prev(asks_[index].end())};
+            
             if (best_ask_index_ == -1 || index < best_ask_index_) best_ask_index_ = index;
         }
         match();
     }
 
     void cancel_order(uint32_t order_id) override {
-        auto it_map = order_map_.find(order_id);
-        if (it_map == order_map_.end()) return;
+        if (order_id >= order_map_.size() || !order_map_[order_id].first) return;
 
-        Order* order = it_map->second.first;
-        auto it_in_list = it_map->second.second;
+        Order* order = order_map_[order_id].first;
+        auto it_in_list = order_map_[order_id].second;
         int32_t index = price_to_index(order->price);
 
         if (order->side == Side::BUY) {
@@ -67,8 +66,8 @@ public:
         }
 
         order->status = OrderStatus::CANCELED;
-        order_map_.erase(it_map);
         allocator_.deallocate(order);
+        order_map_[order_id] = {nullptr, {}};
     }
 
 private:
@@ -100,13 +99,13 @@ private:
             ask_order->leaves_qty -= trade_qty;
 
             if (bid_order->leaves_qty == 0) {
-                order_map_.erase(bid_order->order_id);
+                order_map_[bid_order->order_id] = {nullptr, {}};
                 bid_list.pop_front();
                 allocator_.deallocate(bid_order);
                 if (bid_list.empty()) update_best_bid();
             }
             if (ask_order->leaves_qty == 0) {
-                order_map_.erase(ask_order->order_id);
+                order_map_[ask_order->order_id] = {nullptr, {}};
                 ask_list.pop_front();
                 allocator_.deallocate(ask_order);
                 if (ask_list.empty()) update_best_ask();
@@ -136,7 +135,7 @@ private:
     Allocator allocator_;
     uint32_t min_price_, max_price_, tick_size_;
     int32_t best_bid_index_, best_ask_index_;
-    std::unordered_map<uint32_t, std::pair<Order*, std::list<Order*>::iterator>> order_map_;
+    std::vector<std::pair<Order*, typename std::list<Order*>::iterator>> order_map_;
     std::vector<std::list<Order*>> bids_, asks_;
 };
 

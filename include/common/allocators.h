@@ -14,7 +14,6 @@ public:
     T* allocate(Args&&... args) {
         return new T(std::forward<Args>(args)...);
     }
-
     void deallocate(T* ptr) {
         delete ptr;
     }
@@ -23,36 +22,48 @@ public:
 template <typename T, size_t PoolSize = 1000000>
 class PoolAllocator {
 private:
-    struct alignas(alignof(T)) Element {
+    union Element {
         std::byte raw_data[sizeof(T)];
+        Element* next_free;
     };
 
     std::vector<Element> raw_pool_;
-    std::vector<T*> free_list_;
+    Element* free_head_ = nullptr;
 
 public:
     PoolAllocator() {
         raw_pool_.resize(PoolSize);
-        free_list_.reserve(PoolSize);
-        for (size_t i = 0; i < PoolSize; ++i) {
-            free_list_.push_back(reinterpret_cast<T*>(&raw_pool_[i]));
+        for (size_t i = 0; i < PoolSize - 1; ++i) {
+            raw_pool_[i].next_free = &raw_pool_[i + 1];
         }
+        raw_pool_[PoolSize - 1].next_free = nullptr;
+        free_head_ = &raw_pool_[0];
     }
 
     template <typename... Args>
     T* allocate(Args&&... args) {
-        if (free_list_.empty()) return new T(std::forward<Args>(args)...);
+        if (!free_head_) return new T(std::forward<Args>(args)...);
         
-        T* ptr = free_list_.back();
-        free_list_.pop_back();
+        Element* chunk = free_head_;
+        free_head_ = free_head_->next_free;
         
-        new (ptr) T(std::forward<Args>(args)...);
-        return ptr;
+        return new (chunk->raw_data) T(std::forward<Args>(args)...);
     }
 
     void deallocate(T* ptr) {
         if (!ptr) return;
-        free_list_.push_back(ptr);
+        ptr->~T();
+        auto* byte_ptr = reinterpret_cast<std::byte*>(ptr);
+        auto* pool_start = reinterpret_cast<std::byte*>(raw_pool_.data());
+        auto* pool_end = pool_start + raw_pool_.size() * sizeof(Element);
+
+        if (byte_ptr >= pool_start && byte_ptr < pool_end) {
+            Element* chunk = reinterpret_cast<Element*>(ptr);
+            chunk->next_free = free_head_;
+            free_head_ = chunk;
+        } else {
+            ::operator delete(ptr);
+        }
     }
 };
 
