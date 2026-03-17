@@ -19,7 +19,7 @@ if(MSVC)
     add_link_options("$<$<CONFIG:Debug>:/INCREMENTAL:NO>")
 else()
     # GCC/Clang Release 极致优化 (指令集全开，关闭严格混叠)
-    add_compile_options("$<$<CONFIG:Release>:-O3;-march=native;-fno-strict-aliasing;-ffast-math>")
+    add_compile_options("$<$<CONFIG:Release>:-O3;-g;-march=native;-fno-strict-aliasing;-ffast-math>")
     
     # GCC/Clang Debug 开启 Address & Undefined Behavior Sanitizer
     add_compile_options("$<$<CONFIG:Debug>:-fsanitize=address,undefined;-g;-O0;-fno-omit-frame-pointer>")
